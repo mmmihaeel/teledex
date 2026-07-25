@@ -291,6 +291,9 @@ test("CodexWorkerPool passes the stored rollout path into app-server-v2 managed 
     },
     config: {
       codexBinPath: "codex",
+      codexConfigPath: path.join(sessionsRoot, "missing-codex-config.toml"),
+      codexModel: "gpt-5.5",
+      codexReasoningEffort: "xhigh",
       codexGatewayBackend: "app-server-v2",
       codexEnableAppServerV2: true,
       maxParallelSessions: 1,
@@ -2485,6 +2488,9 @@ test("CodexWorkerPool keeps app-server-v2 thread continuity across transport los
     },
     config: {
       codexBinPath: "codex",
+      codexConfigPath: path.join(sessionsRoot, "missing-codex-config.toml"),
+      codexModel: "gpt-5.5",
+      codexReasoningEffort: "xhigh",
       codexGatewayBackend: "app-server-v2",
       codexEnableAppServerV2: true,
       maxParallelSessions: 1,
