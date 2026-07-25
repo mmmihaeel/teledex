@@ -1,0 +1,578 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+
+import {
+  loadLiveLeaderGeneration,
+  performServiceRollout,
+  signalGenerationRollout,
+  waitForLiveLeaderGeneration,
+  waitForRolloutTrafficShift,
+} from "../src/runtime/service-rollout-command.js";
+
+test("loadLiveLeaderGeneration returns the live leader and generation record", async () => {
+  const result = await loadLiveLeaderGeneration({
+    generationStore: {
+      async loadLeaderLease() {
+        return { generation_id: "gen-a", pid: 1234 };
+      },
+      isLeaderLeaseLive(lease) {
+        return lease.generation_id === "gen-a";
+      },
+      async loadGeneration(generationId) {
+        return {
+          generation_id: generationId,
+          ipc_endpoint: "http://127.0.0.1:39001/ipc/forward-agent/token",
+        };
+      },
+      isGenerationRecordLive(record) {
+        return Boolean(record?.generation_id);
+      },
+    },
+  });
+
+  assert.equal(result.lease.generation_id, "gen-a");
+  assert.equal(result.generation.generation_id, "gen-a");
+});
+
+test("signalGenerationRollout targets the leader pid with SIGUSR2", () => {
+  const signals = [];
+  signalGenerationRollout(
+    {
+      lease: {
+        pid: 4821,
+      },
+    },
+    {
+      processImpl: {
+        kill(pid, signal) {
+          signals.push({ pid, signal });
+        },
+      },
+    },
+  );
+
+  assert.deepEqual(signals, [{ pid: 4821, signal: "SIGUSR2" }]);
+});
+
+test("waitForLiveLeaderGeneration waits until the expected leader appears", async () => {
+  let calls = 0;
+  const leader = await waitForLiveLeaderGeneration({
+    timeoutMs: 250,
+    pollIntervalMs: 5,
+    generationStore: {
+      async loadLeaderLease() {
+        calls += 1;
+        if (calls < 3) {
+          return null;
+        }
+        return { generation_id: "gen-b", pid: 222 };
+      },
+      isLeaderLeaseLive(lease) {
+        return Boolean(lease?.generation_id);
+      },
+      async loadGeneration(generationId) {
+        return {
+          generation_id: generationId,
+          ipc_endpoint: "http://127.0.0.1:39002/ipc/forward-agent/token",
+        };
+      },
+      isGenerationRecordLive(record) {
+        return Boolean(record?.generation_id);
+      },
+    },
+  });
+
+  assert.equal(leader.lease.generation_id, "gen-b");
+});
+
+test("waitForRolloutTrafficShift returns once the replacement generation becomes leader", async () => {
+  let stateCalls = 0;
+  const shifted = await waitForRolloutTrafficShift({
+    previousGenerationId: "gen-old",
+    timeoutMs: 50,
+    pollIntervalMs: 1,
+    rolloutCoordinationStore: {
+      async load() {
+        stateCalls += 1;
+        if (stateCalls < 2) {
+          return {
+            status: "requested",
+            target_generation_id: null,
+          };
+        }
+        return {
+          status: "in_progress",
+          target_generation_id: "gen-new",
+        };
+      },
+    },
+    generationStore: {
+      async loadLeaderLease() {
+        return { generation_id: "gen-new", pid: 333 };
+      },
+      isLeaderLeaseLive(lease) {
+        return Boolean(lease?.generation_id);
+      },
+      async loadGeneration(generationId) {
+        return {
+          generation_id: generationId,
+          ipc_endpoint: "http://127.0.0.1:39003/ipc/forward-agent/token",
+        };
+      },
+      isGenerationRecordLive(record) {
+        return Boolean(record?.generation_id);
+      },
+    },
+  });
+
+  assert.equal(shifted.targetGenerationId, "gen-new");
+  assert.equal(shifted.leader.lease.pid, 333);
+});
+
+test("performServiceRollout falls back to restart when no live leader exists", async () => {
+  const calls = [];
+  const result = await performServiceRollout({
+    generationStore: {},
+    rolloutCoordinationStore: {
+      async clear() {
+        calls.push("clear");
+      },
+    },
+    restartService: async () => {
+      calls.push("restart");
+    },
+    loadLeaderGeneration: async () => null,
+    waitForLeaderGeneration: async () => ({
+      lease: {
+        generation_id: "gen-restarted",
+        pid: 991,
+      },
+    }),
+  });
+
+  assert.deepEqual(calls, ["clear", "restart"]);
+  assert.deepEqual(result, {
+    mode: "restart-fallback",
+    leaderGenerationId: "gen-restarted",
+    leaderPid: 991,
+  });
+});
+
+test("performServiceRollout requests and waits for a replacement leader when one is live", async () => {
+  const calls = [];
+  const result = await performServiceRollout({
+    generationStore: {},
+    rolloutCoordinationStore: {
+      async load() {
+        calls.push("load");
+        return {
+          status: "idle",
+          target_generation_id: null,
+        };
+      },
+      async requestRollout(payload) {
+        calls.push(["request", payload]);
+      },
+    },
+    restartService: async () => {
+      calls.push("restart");
+    },
+    loadLeaderGeneration: async () => ({
+      lease: {
+        generation_id: "gen-old",
+        pid: 111,
+      },
+    }),
+    signalRollout(generation) {
+      calls.push(["signal", generation.lease.generation_id]);
+    },
+    waitForTrafficShift: async () => ({
+      state: {
+        status: "in_progress",
+      },
+      targetGenerationId: "gen-new",
+      leader: {
+        lease: {
+          pid: 222,
+        },
+      },
+    }),
+  });
+
+  assert.deepEqual(calls, [
+    "load",
+    [
+      "request",
+      {
+        currentGenerationId: "gen-old",
+        requestedBy: "service-rollout",
+      },
+    ],
+    ["signal", "gen-old"],
+  ]);
+  assert.deepEqual(result, {
+    mode: "soft-rollout",
+    previousGenerationId: "gen-old",
+    leaderGenerationId: "gen-new",
+    leaderPid: 222,
+    rolloutStatus: "in_progress",
+    retainedSessionCount: 0,
+  });
+});
+
+test("performServiceRollout reports an existing settled rollout when the target already leads", async () => {
+  const calls = [];
+  const result = await performServiceRollout({
+    generationStore: {},
+    rolloutCoordinationStore: {
+      async load() {
+        calls.push("load");
+        return {
+          status: "in_progress",
+          current_generation_id: "gen-current",
+          target_generation_id: "gen-current",
+          retiring_generation_id: null,
+          retained_session_keys: [],
+        };
+      },
+    },
+    restartService: async () => {
+      throw new Error("should not restart");
+    },
+    loadLeaderGeneration: async () => ({
+      lease: {
+        generation_id: "gen-current",
+        pid: 333,
+      },
+    }),
+    signalRollout(generation) {
+      calls.push(["signal", generation.lease.generation_id]);
+    },
+    waitForTrafficShift: async () => {
+      throw new Error("should not wait");
+    },
+  });
+
+  assert.deepEqual(calls, ["load"]);
+  assert.deepEqual(result, {
+    mode: "soft-rollout-existing",
+    leaderGenerationId: "gen-current",
+    leaderPid: 333,
+    rolloutStatus: "in_progress",
+    retainedSessionCount: 0,
+  });
+});
+
+test("performServiceRollout chains a new soft rollout after traffic has shifted but retained sessions remain", async () => {
+  const calls = [];
+  const result = await performServiceRollout({
+    generationStore: {},
+    rolloutCoordinationStore: {
+      async load() {
+        calls.push("load");
+        return {
+          status: "in_progress",
+          current_generation_id: "gen-current",
+          target_generation_id: "gen-current",
+          retiring_generation_id: "gen-old",
+          retained_session_keys: ["topic-a", "topic-b"],
+        };
+      },
+      async requestRollout(payload) {
+        calls.push(["request", payload]);
+      },
+    },
+    restartService: async () => {
+      throw new Error("should not restart");
+    },
+    loadLeaderGeneration: async () => ({
+      lease: {
+        generation_id: "gen-current",
+        pid: 333,
+      },
+    }),
+    signalRollout(generation) {
+      calls.push(["signal", generation.lease.generation_id]);
+    },
+    waitForTrafficShift: async (payload) => {
+      calls.push(["wait", payload.previousGenerationId]);
+      return {
+        state: {
+          status: "in_progress",
+          retiring_generation_id: "gen-current",
+          retained_session_keys: ["topic-c"],
+        },
+        targetGenerationId: "gen-next",
+        leader: {
+          lease: {
+            pid: 444,
+          },
+        },
+      };
+    },
+  });
+
+  assert.deepEqual(calls, [
+    "load",
+    [
+      "request",
+      {
+        currentGenerationId: "gen-current",
+        requestedBy: "service-rollout",
+      },
+    ],
+    ["signal", "gen-current"],
+    ["wait", "gen-current"],
+  ]);
+  assert.deepEqual(result, {
+    mode: "soft-rollout-chained",
+    previousGenerationId: "gen-current",
+    leaderGenerationId: "gen-next",
+    leaderPid: 444,
+    rolloutStatus: "in_progress",
+    retiringGenerationId: "gen-current",
+    retainedSessionCount: 1,
+  });
+});
+
+test("performServiceRollout waits for an already requested target rollout instead of chaining", async () => {
+  const calls = [];
+  const result = await performServiceRollout({
+    generationStore: {},
+    rolloutCoordinationStore: {
+      async load() {
+        calls.push("load");
+        return {
+          status: "requested",
+          current_generation_id: "gen-current",
+          target_generation_id: "gen-next",
+          retiring_generation_id: "gen-current",
+        };
+      },
+    },
+    restartService: async () => {
+      throw new Error("should not restart");
+    },
+    loadLeaderGeneration: async () => ({
+      lease: {
+        generation_id: "gen-current",
+        pid: 333,
+      },
+    }),
+    signalRollout(generation) {
+      calls.push(["signal", generation.lease.generation_id]);
+    },
+    waitForTrafficShift: async (payload) => {
+      calls.push(["wait", payload.previousGenerationId]);
+      return {
+        state: {
+          status: "in_progress",
+          retiring_generation_id: "gen-current",
+          retained_session_keys: ["topic-a"],
+        },
+        targetGenerationId: "gen-next",
+        leader: {
+          lease: {
+            pid: 444,
+          },
+        },
+      };
+    },
+  });
+
+  assert.deepEqual(calls, ["load", ["wait", "gen-current"]]);
+  assert.deepEqual(result, {
+    mode: "soft-rollout-existing",
+    previousGenerationId: "gen-current",
+    leaderGenerationId: "gen-next",
+    leaderPid: 444,
+    rolloutStatus: "in_progress",
+    retiringGenerationId: "gen-current",
+    retainedSessionCount: 1,
+  });
+});
+
+test("performServiceRollout does not fail an adopted rollout when waiting times out", async () => {
+  const calls = [];
+  await assert.rejects(
+    performServiceRollout({
+      generationStore: {},
+      rolloutCoordinationStore: {
+        async load() {
+          calls.push("load");
+          return {
+            status: "requested",
+            current_generation_id: "gen-current",
+            target_generation_id: "gen-next",
+            retiring_generation_id: "gen-current",
+          };
+        },
+        async failRollout() {
+          calls.push("fail");
+        },
+      },
+      restartService: async () => {
+        throw new Error("should not restart");
+      },
+      loadLeaderGeneration: async () => ({
+        lease: {
+          generation_id: "gen-current",
+          pid: 333,
+        },
+      }),
+      waitForTrafficShift: async () => {
+        calls.push("wait");
+        throw new Error("timed out");
+      },
+    }),
+    /timed out/u,
+  );
+
+  assert.deepEqual(calls, ["load", "wait"]);
+});
+
+test("performServiceRollout resumes a dangling requested rollout without duplicating the request", async () => {
+  const calls = [];
+  const result = await performServiceRollout({
+    generationStore: {},
+    rolloutCoordinationStore: {
+      async load() {
+        calls.push("load");
+        return {
+          status: "requested",
+          current_generation_id: "gen-current",
+          target_generation_id: null,
+        };
+      },
+      async requestRollout() {
+        throw new Error("should not request again");
+      },
+    },
+    restartService: async () => {
+      throw new Error("should not restart");
+    },
+    loadLeaderGeneration: async () => ({
+      lease: {
+        generation_id: "gen-current",
+        pid: 333,
+      },
+    }),
+    signalRollout(generation) {
+      calls.push(["signal", generation.lease.generation_id]);
+    },
+    waitForTrafficShift: async () => ({
+      state: {
+        status: "in_progress",
+      },
+      targetGenerationId: "gen-next",
+      leader: {
+        lease: {
+          pid: 444,
+        },
+      },
+    }),
+  });
+
+  assert.deepEqual(calls, ["load", ["signal", "gen-current"]]);
+  assert.deepEqual(result, {
+    mode: "soft-rollout-resumed",
+    previousGenerationId: "gen-current",
+    leaderGenerationId: "gen-next",
+    leaderPid: 444,
+    rolloutStatus: "in_progress",
+    retainedSessionCount: 0,
+  });
+});
+
+test("performServiceRollout still refuses unresumable settling state without a target", async () => {
+  const calls = [];
+  await assert.rejects(
+    performServiceRollout({
+      generationStore: {},
+      rolloutCoordinationStore: {
+        async load() {
+          calls.push("load");
+          return {
+            status: "in_progress",
+            current_generation_id: "gen-old",
+            target_generation_id: null,
+          };
+        },
+      },
+      restartService: async () => {
+        throw new Error("should not restart");
+      },
+      loadLeaderGeneration: async () => ({
+        lease: {
+          generation_id: "gen-current",
+          pid: 333,
+        },
+      }),
+      signalRollout(generation) {
+        calls.push(["signal", generation.lease.generation_id]);
+      },
+    }),
+    /Cannot start a new soft rollout while the previous rollout request is still settling/u,
+  );
+
+  assert.deepEqual(calls, ["load"]);
+});
+
+test("performServiceRollout marks the rollout as failed when signaling the leader throws", async () => {
+  const calls = [];
+  await assert.rejects(
+    performServiceRollout({
+      generationStore: {},
+      rolloutCoordinationStore: {
+        async load() {
+          calls.push("load");
+          return {
+            status: "idle",
+            target_generation_id: null,
+          };
+        },
+        async requestRollout(payload) {
+          calls.push(["request", payload]);
+        },
+        async failRollout(message, details) {
+          calls.push(["fail", message, details]);
+        },
+      },
+      restartService: async () => {
+        throw new Error("should not restart");
+      },
+      loadLeaderGeneration: async () => ({
+        lease: {
+          generation_id: "gen-old",
+          pid: 111,
+        },
+      }),
+      signalRollout() {
+        throw new Error("signal failed");
+      },
+      waitForTrafficShift: async () => {
+        throw new Error("should not wait");
+      },
+    }),
+    /signal failed/u,
+  );
+
+  assert.deepEqual(calls, [
+    "load",
+    [
+      "request",
+      {
+        currentGenerationId: "gen-old",
+        requestedBy: "service-rollout",
+      },
+    ],
+    [
+      "fail",
+      "signal failed",
+      {
+        currentGenerationId: "gen-old",
+        targetGenerationId: null,
+      },
+    ],
+  ]);
+});

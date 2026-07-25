@@ -1,0 +1,89 @@
+import { deliverDocumentToTopic } from "../transport/topic-document-delivery.js";
+
+function isMissingReplyTargetError(error) {
+  return String(error?.message || "")
+    .toLowerCase()
+    .includes("message to be replied not found");
+}
+
+async function sendDocumentToTopic(api, message, document) {
+  return deliverDocumentToTopic({
+    api,
+    chatId: message.chat.id,
+    messageThreadId: message.message_thread_id,
+    replyToMessageId: document.replyToMessageId,
+    document: {
+      filePath: document.filePath,
+      fileName: document.fileName,
+      caption: document.caption,
+      contentType: document.contentType,
+    },
+  });
+}
+
+async function handleDeliveryError(session, error, lifecycleManager) {
+  const lifecycleResult = await lifecycleManager?.handleTransportError(
+    session,
+    error,
+  );
+  if (lifecycleResult?.handled) {
+    return {
+      delivered: false,
+      parked: lifecycleResult.parked === true,
+      session: lifecycleResult.session || session,
+    };
+  }
+
+  throw error;
+}
+
+export async function safeSendMessage(api, params, session, lifecycleManager) {
+  const deliveryParams = { ...params };
+  let allowReplyTargetFallback = Boolean(deliveryParams.reply_to_message_id);
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      await api.sendMessage(deliveryParams);
+      return {
+        delivered: true,
+        session,
+      };
+    } catch (error) {
+      if (allowReplyTargetFallback && isMissingReplyTargetError(error)) {
+        delete deliveryParams.reply_to_message_id;
+        allowReplyTargetFallback = false;
+        continue;
+      }
+
+      return handleDeliveryError(session, error, lifecycleManager);
+    }
+  }
+}
+
+export async function safeSendDocumentToTopic(
+  api,
+  message,
+  document,
+  session,
+  lifecycleManager,
+) {
+  let currentDocument = { ...document };
+  let allowReplyTargetFallback = Boolean(currentDocument.replyToMessageId);
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      return await sendDocumentToTopic(api, message, currentDocument);
+    } catch (error) {
+      if (allowReplyTargetFallback && isMissingReplyTargetError(error)) {
+        currentDocument = {
+          ...currentDocument,
+          replyToMessageId: null,
+        };
+        allowReplyTargetFallback = false;
+        continue;
+      }
+
+      return handleDeliveryError(session, error, lifecycleManager);
+    }
+  }
+}

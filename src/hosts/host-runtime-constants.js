@@ -1,0 +1,2 @@
+export const REQUIRED_HOST_NODE_MAJOR = 20;
+export const NODE_SOURCE_INSTALL_MAJOR = 24;

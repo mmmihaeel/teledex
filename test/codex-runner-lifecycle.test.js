@@ -1,0 +1,905 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+
+import { runCodexTask } from "../src/pty-worker/codex-runner.js";
+import {
+  createMockChild,
+  createMockWebSocket,
+  createStandardRequestHandlers,
+  emitListenBanner,
+  waitForCondition,
+} from "../test-support/codex-runner-fixtures.js";
+
+test("runCodexTask ignores foreign thread completion events and only finishes the primary thread", async () => {
+  const child = createMockChild();
+  const ws = createMockWebSocket({
+    requestHandlers: createStandardRequestHandlers(),
+  });
+  const summaries = [];
+  const run = runCodexTask({
+    codexBinPath: "codex",
+    cwd: process.cwd(),
+    prompt: "Verify a foreign turn/completed.",
+    onEvent(summary) {
+      summaries.push(summary);
+    },
+    spawnImpl() {
+      return child;
+    },
+    openWebSocketImpl: async () => ws,
+  });
+
+  emitListenBanner(child, 43123);
+  await waitForCondition(
+    () => ws.sentMessages.some((message) => message.method === "turn/start"),
+  );
+
+  ws.emitNotification({
+    method: "turn/completed",
+    params: {
+      threadId: "foreign-thread",
+      turn: {
+        id: "foreign-turn",
+      },
+    },
+  });
+
+  let settled = false;
+  void run.finished.finally(() => {
+    settled = true;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(settled, false);
+
+  ws.emitNotification({
+    method: "item/completed",
+    params: {
+      threadId: "foreign-thread",
+      turnId: "foreign-turn",
+      item: {
+        type: "agentMessage",
+        text: "Hint from a subagent.",
+        phase: "commentary",
+      },
+    },
+  });
+  ws.emitNotification({
+    method: "turn/completed",
+    params: {
+      threadId: "root-thread",
+      turn: {
+        id: "root-turn",
+      },
+    },
+  });
+
+  const result = await run.finished;
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.threadId, "root-thread");
+  assert.equal(
+    summaries.some((summary) => summary.isPrimaryThreadEvent === false),
+    true,
+  );
+});
+
+test("runCodexTask forwards developerInstructions to thread/start", async () => {
+  const child = createMockChild();
+  const captured = [];
+  const ws = createMockWebSocket({
+    requestHandlers: {
+      initialize() {
+        return { ok: true };
+      },
+      "thread/start"(params) {
+        captured.push(params);
+        return {
+          thread: {
+            id: "root-thread",
+          },
+        };
+      },
+      "turn/start"() {
+        return {
+          turn: {
+            id: "root-turn",
+          },
+        };
+      },
+    },
+  });
+
+  const run = runCodexTask({
+    codexBinPath: "codex",
+    cwd: process.cwd(),
+    prompt: "Complete the task.",
+    developerInstructions: "Context:\n- bound host: local\n- workspace cwd: /path/to/workspace",
+    spawnImpl() {
+      return child;
+    },
+    openWebSocketImpl: async () => ws,
+  });
+
+  emitListenBanner(child, 43143);
+  await waitForCondition(() => captured.length === 1);
+  assert.equal(
+    captured[0].developerInstructions,
+    "Context:\n- bound host: local\n- workspace cwd: /path/to/workspace",
+  );
+  assert.equal("baseInstructions" in captured[0], false);
+
+  ws.emitNotification({
+    method: "turn/completed",
+    params: {
+      threadId: "root-thread",
+      turn: {
+        id: "root-turn",
+      },
+    },
+  });
+
+  const finished = await run.finished;
+  assert.equal(finished.exitCode, 0);
+});
+
+test("runCodexTask forwards developerInstructions to thread/resume", async () => {
+  const child = createMockChild();
+  const captured = [];
+  const ws = createMockWebSocket({
+    requestHandlers: {
+      initialize() {
+        return { ok: true };
+      },
+      "thread/resume"(params) {
+        captured.push(params);
+        return {
+          thread: {
+            id: "root-thread",
+          },
+        };
+      },
+      "turn/start"() {
+        return {
+          turn: {
+            id: "root-turn",
+          },
+        };
+      },
+    },
+  });
+
+  const run = runCodexTask({
+    codexBinPath: "codex",
+    cwd: process.cwd(),
+    prompt: "Continue.",
+    developerInstructions: "Context:\n- bound host: local\n- workspace cwd: /path/to/workspace",
+    sessionThreadId: "root-thread",
+    spawnImpl() {
+      return child;
+    },
+    openWebSocketImpl: async () => ws,
+  });
+
+  emitListenBanner(child, 43144);
+  await waitForCondition(() => captured.length === 1);
+  assert.equal(
+    captured[0].developerInstructions,
+    "Context:\n- bound host: local\n- workspace cwd: /path/to/workspace",
+  );
+  assert.equal("baseInstructions" in captured[0], false);
+
+  ws.emitNotification({
+    method: "turn/completed",
+    params: {
+      threadId: "root-thread",
+      turn: {
+        id: "root-turn",
+      },
+    },
+  });
+
+  const finished = await run.finished;
+  assert.equal(finished.exitCode, 0);
+});
+
+test("runCodexTask maps legacy baseInstructions to developerInstructions", async () => {
+  const child = createMockChild();
+  const captured = [];
+  const ws = createMockWebSocket({
+    requestHandlers: {
+      initialize() {
+        return { ok: true };
+      },
+      "thread/start"(params) {
+        captured.push(params);
+        return {
+          thread: {
+            id: "root-thread",
+          },
+        };
+      },
+      "turn/start"() {
+        return {
+          turn: {
+            id: "root-turn",
+          },
+        };
+      },
+    },
+  });
+
+  const run = runCodexTask({
+    codexBinPath: "codex",
+    cwd: process.cwd(),
+    prompt: "Complete the task.",
+    baseInstructions: "Context:\n- legacy caller still works",
+    spawnImpl() {
+      return child;
+    },
+    openWebSocketImpl: async () => ws,
+  });
+
+  emitListenBanner(child, 43145);
+  await waitForCondition(() => captured.length === 1);
+  assert.equal(
+    captured[0].developerInstructions,
+    "Context:\n- legacy caller still works",
+  );
+  assert.equal("baseInstructions" in captured[0], false);
+
+  ws.emitNotification({
+    method: "turn/completed",
+    params: {
+      threadId: "root-thread",
+      turn: {
+        id: "root-turn",
+      },
+    },
+  });
+
+  const finished = await run.finished;
+  assert.equal(finished.exitCode, 0);
+});
+
+test("runCodexTask keeps refreshing the active turn id across many steer responses", async (t) => {
+  const child = createMockChild();
+  const codexSessionsRoot = await fs.mkdtemp(
+    path.join(os.tmpdir(), "codex-runner-steer-turn-id-"),
+  );
+  t.after(async () => {
+    await fs.rm(codexSessionsRoot, { recursive: true, force: true });
+  });
+
+  const steerCount = 100;
+  const steerExpectedTurnIds = [];
+  const ws = createMockWebSocket({
+    requestHandlers: createStandardRequestHandlers({
+      turnId: "turn-1",
+      onTurnSteer(params) {
+        steerExpectedTurnIds.push(params.expectedTurnId);
+        const expectedIndex = steerExpectedTurnIds.length;
+        assert.equal(
+          params.expectedTurnId,
+          `turn-${expectedIndex}`,
+          `unexpected steer turn id at step ${expectedIndex}`,
+        );
+        return {
+          turn: {
+            id: `turn-${expectedIndex + 1}`,
+          },
+        };
+      },
+    }),
+  });
+
+  const run = runCodexTask({
+    codexBinPath: "codex",
+    cwd: process.cwd(),
+    prompt: "Allow repeated steer updates.",
+    spawnImpl() {
+      return child;
+    },
+    openWebSocketImpl: async () => ws,
+    codexSessionsRoot,
+  });
+
+  emitListenBanner(child, 43128);
+  await waitForCondition(
+    () => ws.sentMessages.some((message) => message.method === "turn/start"),
+  );
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  for (let index = 1; index <= steerCount; index += 1) {
+    const steerResult = await run.steer({
+      input: [{ type: "text", text: `follow-up ${index}` }],
+    });
+    assert.equal(steerResult.ok, true);
+    assert.equal(steerResult.reason, "steered");
+    assert.equal(steerResult.turnId, `turn-${index + 1}`);
+  }
+
+  assert.deepEqual(
+    steerExpectedTurnIds,
+    Array.from({ length: steerCount }, (_, index) => `turn-${index + 1}`),
+  );
+
+  ws.emitNotification({
+    method: "turn/completed",
+    params: {
+      threadId: "root-thread",
+      turnId: `turn-${steerCount + 1}`,
+    },
+  });
+
+  const finished = await run.finished;
+  assert.equal(finished.exitCode, 0);
+});
+
+test("runCodexTask refreshes the active turn from thread/resume after a transient steer rejection", async () => {
+  const child = createMockChild();
+  const steerExpectedTurnIds = [];
+  let threadResumeCalls = 0;
+  let runtimeActiveTurnId = null;
+  const ws = createMockWebSocket({
+    requestHandlers: {
+      initialize() {
+        return { ok: true };
+      },
+      "thread/start"() {
+        return {
+          thread: {
+            id: "root-thread",
+          },
+        };
+      },
+      "thread/resume"() {
+        threadResumeCalls += 1;
+        return {
+          thread: {
+            id: "root-thread",
+            turns: [
+              {
+                id: "turn-reattached",
+                status: "inProgress",
+              },
+            ],
+          },
+        };
+      },
+      "turn/start"() {
+        return {
+          turn: {
+            id: "turn-started",
+          },
+        };
+      },
+      "turn/steer"(params) {
+        steerExpectedTurnIds.push(params.expectedTurnId);
+        if (steerExpectedTurnIds.length === 1) {
+          throw new Error("no active turn to steer");
+        }
+
+        return {
+          turn: {
+            id: "turn-steered",
+          },
+        };
+      },
+    },
+  });
+
+  const run = runCodexTask({
+    codexBinPath: "codex",
+    cwd: process.cwd(),
+    prompt: "Refresh steer after transient no-active-turn.",
+    onRuntimeState(payload) {
+      runtimeActiveTurnId = payload?.activeTurnId || runtimeActiveTurnId;
+    },
+    spawnImpl() {
+      return child;
+    },
+    openWebSocketImpl: async () => ws,
+  });
+
+  emitListenBanner(child, 43130);
+  await waitForCondition(
+    () => ws.sentMessages.some((message) => message.method === "turn/start"),
+  );
+  await waitForCondition(() => runtimeActiveTurnId === "turn-started");
+
+  const steerResult = await run.steer({
+    input: [{ type: "text", text: "follow-up" }],
+  });
+  assert.equal(steerResult.ok, true);
+  assert.equal(steerResult.reason, "steered");
+  assert.equal(steerResult.turnId, "turn-steered");
+  assert.deepEqual(steerExpectedTurnIds, ["turn-started", "turn-reattached"]);
+  assert.equal(threadResumeCalls, 1);
+
+  ws.emitNotification({
+    method: "turn/completed",
+    params: {
+      threadId: "root-thread",
+      turnId: "turn-steered",
+    },
+  });
+
+  const finished = await run.finished;
+  assert.equal(finished.exitCode, 0);
+});
+
+test("runCodexTask returns steer-timeout when turn/steer stops responding", async () => {
+  const child = createMockChild();
+  const ws = createMockWebSocket({
+    requestHandlers: {
+      ...createStandardRequestHandlers(),
+      "turn/steer"() {
+        return new Promise(() => {});
+      },
+    },
+  });
+
+  const run = runCodexTask({
+    codexBinPath: "codex",
+    cwd: process.cwd(),
+    prompt: "Do not wedge on a hung steer RPC.",
+    steerRequestTimeoutMs: 25,
+    spawnImpl() {
+      return child;
+    },
+    openWebSocketImpl: async () => ws,
+  });
+
+  emitListenBanner(child, 43131);
+  await waitForCondition(
+    () => ws.sentMessages.some((message) => message.method === "turn/start"),
+  );
+
+  const steerResult = await run.steer({
+    input: [{ type: "text", text: "follow-up" }],
+  });
+  assert.equal(steerResult.ok, false);
+  assert.equal(steerResult.reason, "steer-timeout");
+  assert.match(String(steerResult.error?.message || ""), /turn\/steer timed out/u);
+
+  ws.emitNotification({
+    method: "turn/completed",
+    params: {
+      threadId: "root-thread",
+      turnId: "root-turn",
+    },
+  });
+
+  const finished = await run.finished;
+  assert.equal(finished.exitCode, 0);
+});
+
+test("runCodexTask waits for async final message handling before resolving turn completion", async () => {
+  const child = createMockChild();
+  const ws = createMockWebSocket({
+    requestHandlers: createStandardRequestHandlers(),
+  });
+
+  let finalMessageHandled = false;
+  const run = runCodexTask({
+    codexBinPath: "codex",
+    cwd: process.cwd(),
+    prompt: "Do not outrun the async final handler.",
+    onEvent: async (summary) => {
+      if (summary.kind === "agent_message" && summary.messagePhase === "final_answer") {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        finalMessageHandled = true;
+      }
+    },
+    spawnImpl() {
+      return child;
+    },
+    openWebSocketImpl: async () => ws,
+  });
+
+  emitListenBanner(child, 43129);
+  await waitForCondition(
+    () => ws.sentMessages.some((message) => message.method === "turn/start"),
+  );
+
+  ws.emitNotification({
+    method: "item/completed",
+    params: {
+      threadId: "root-thread",
+      turnId: "root-turn",
+      item: {
+        type: "agentMessage",
+        text: "Final.",
+        phase: "final_answer",
+      },
+    },
+  });
+  ws.emitNotification({
+    method: "turn/completed",
+    params: {
+      threadId: "root-thread",
+      turn: {
+        id: "root-turn",
+      },
+    },
+  });
+
+  const result = await run.finished;
+  assert.equal(result.exitCode, 0);
+  assert.equal(finalMessageHandled, true);
+});
+
+test("runCodexTask treats turn/completed with interrupted status as interrupted instead of success", async () => {
+  const child = createMockChild();
+  const ws = createMockWebSocket({
+    requestHandlers: createStandardRequestHandlers(),
+  });
+
+  const run = runCodexTask({
+    codexBinPath: "codex",
+    cwd: process.cwd(),
+    prompt: "Verify interrupted turn/completed.",
+    spawnImpl() {
+      return child;
+    },
+    openWebSocketImpl: async () => ws,
+  });
+
+  emitListenBanner(child, 43139);
+  await waitForCondition(
+    () => ws.sentMessages.some((message) => message.method === "turn/start"),
+  );
+
+  ws.emitNotification({
+    method: "turn/completed",
+    params: {
+      threadId: "root-thread",
+      turn: {
+        id: "root-turn",
+        status: "interrupted",
+      },
+    },
+  });
+
+  const result = await run.finished;
+  assert.equal(result.exitCode, null);
+  assert.equal(result.signal, "SIGINT");
+  assert.equal(result.interrupted, true);
+  assert.equal(result.abortReason, "interrupted");
+  assert.deepEqual(result.resumeReplacement, {
+    requestedThreadId: "root-thread",
+    replacementThreadId: null,
+    reason: "transport-disconnect",
+  });
+});
+
+test("runCodexTask waits briefly for a late final message after turn completion", async () => {
+  const child = createMockChild();
+  const ws = createMockWebSocket({
+    requestHandlers: createStandardRequestHandlers(),
+  });
+
+  let finalMessageHandled = false;
+  const run = runCodexTask({
+    codexBinPath: "codex",
+    cwd: process.cwd(),
+    prompt: "Preserve a late final after turn/completed.",
+    onEvent: async (summary) => {
+      if (summary.kind === "agent_message" && summary.messagePhase === "final_answer") {
+        finalMessageHandled = true;
+      }
+    },
+    spawnImpl() {
+      return child;
+    },
+    openWebSocketImpl: async () => ws,
+  });
+
+  emitListenBanner(child, 43130);
+  await waitForCondition(
+    () => ws.sentMessages.some((message) => message.method === "turn/start"),
+  );
+
+  ws.emitNotification({
+    method: "turn/completed",
+    params: {
+      threadId: "root-thread",
+      turn: {
+        id: "root-turn",
+      },
+    },
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  child.exitCode = 0;
+  child.emit("close", 0, null);
+
+  setTimeout(() => {
+    ws.emitNotification({
+      method: "item/completed",
+      params: {
+        threadId: "root-thread",
+        turnId: "root-turn",
+        item: {
+          type: "agentMessage",
+          text: "Late final.",
+          phase: "final_answer",
+        },
+      },
+    });
+  }, 10);
+
+  const result = await run.finished;
+  assert.equal(result.exitCode, 0);
+  assert.equal(finalMessageHandled, true);
+});
+
+test("runCodexTask ignores websocket disconnects after turn completion while the final-message grace window is open", async () => {
+  const child = createMockChild();
+  const ws = createMockWebSocket({
+    requestHandlers: createStandardRequestHandlers(),
+  });
+
+  const run = runCodexTask({
+    codexBinPath: "codex",
+    cwd: process.cwd(),
+    prompt: "Do not enter recovery after an already completed turn.",
+    spawnImpl() {
+      return child;
+    },
+    openWebSocketImpl: async () => ws,
+  });
+
+  emitListenBanner(child, 43131);
+  await waitForCondition(
+    () => ws.sentMessages.some((message) => message.method === "turn/start"),
+  );
+
+  ws.emitNotification({
+    method: "turn/completed",
+    params: {
+      threadId: "root-thread",
+      turn: {
+        id: "root-turn",
+      },
+    },
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  ws.emitClose({
+    code: 1006,
+    wasClean: false,
+  });
+  child.exitCode = 0;
+  child.emit("close", 0, null);
+
+  const result = await run.finished;
+  assert.equal(result.exitCode, 0);
+});
+
+test("runCodexTask treats graceful app-server exit before final answer as resumable transport loss", async () => {
+  const child = createMockChild();
+  const ws = createMockWebSocket({
+    requestHandlers: createStandardRequestHandlers(),
+  });
+
+  const run = runCodexTask({
+    codexBinPath: "codex",
+    cwd: process.cwd(),
+    prompt: "Do not fail on code 0 before the final answer.",
+    spawnImpl() {
+      return child;
+    },
+    openWebSocketImpl: async () => ws,
+  });
+
+  emitListenBanner(child, 43133);
+  await waitForCondition(
+    () => ws.sentMessages.some((message) => message.method === "turn/start"),
+  );
+
+  child.exitCode = 0;
+  child.emit("close", 0, null);
+
+  const result = await run.finished;
+  assert.equal(result.exitCode, null);
+  assert.equal(result.signal, "SIGINT");
+  assert.equal(result.interrupted, true);
+  assert.equal(result.interruptReason, "upstream");
+  assert.equal(result.abortReason, "transport_lost");
+  assert.deepEqual(result.resumeReplacement, {
+    requestedThreadId: "root-thread",
+    replacementThreadId: null,
+    reason: "transport-disconnect",
+  });
+});
+
+test("runCodexTask treats graceful app-server exit after final answer as completed", async () => {
+  const child = createMockChild();
+  const ws = createMockWebSocket({
+    requestHandlers: createStandardRequestHandlers(),
+  });
+
+  let finalMessageHandled = false;
+  const run = runCodexTask({
+    codexBinPath: "codex",
+    cwd: process.cwd(),
+    prompt: "Preserve the final when app-server exits cleanly without turn/completed.",
+    onEvent(summary) {
+      if (summary.kind === "agent_message" && summary.messagePhase === "final_answer") {
+        finalMessageHandled = true;
+      }
+    },
+    spawnImpl() {
+      return child;
+    },
+    openWebSocketImpl: async () => ws,
+  });
+
+  emitListenBanner(child, 43134);
+  await waitForCondition(
+    () => ws.sentMessages.some((message) => message.method === "turn/start"),
+  );
+
+  ws.emitNotification({
+    method: "item/completed",
+    params: {
+      threadId: "root-thread",
+      turnId: "root-turn",
+      item: {
+        type: "agentMessage",
+        text: "Final answer.",
+        phase: "final_answer",
+      },
+    },
+  });
+  await waitForCondition(() => finalMessageHandled);
+
+  child.exitCode = 0;
+  child.emit("close", 0, null);
+
+  const result = await run.finished;
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.signal, null);
+  assert.equal(result.interrupted, undefined);
+  assert.equal(result.resumeReplacement, null);
+});
+
+test("runCodexTask does not reuse a previous final answer for a fresh turn", async () => {
+  const child = createMockChild();
+  const ws = createMockWebSocket({
+    requestHandlers: createStandardRequestHandlers(),
+  });
+
+  let finalMessageHandled = false;
+  const run = runCodexTask({
+    codexBinPath: "codex",
+    cwd: process.cwd(),
+    prompt: "Do not treat a new turn as complete because of an old final.",
+    onEvent(summary) {
+      if (summary.kind === "agent_message" && summary.messagePhase === "final_answer") {
+        finalMessageHandled = true;
+      }
+    },
+    spawnImpl() {
+      return child;
+    },
+    openWebSocketImpl: async () => ws,
+  });
+
+  emitListenBanner(child, 43135);
+  await waitForCondition(
+    () => ws.sentMessages.some((message) => message.method === "turn/start"),
+  );
+
+  ws.emitNotification({
+    method: "item/completed",
+    params: {
+      threadId: "root-thread",
+      turnId: "root-turn",
+      item: {
+        type: "agentMessage",
+        text: "Intermediate final from the old turn.",
+        phase: "final_answer",
+      },
+    },
+  });
+  await waitForCondition(() => finalMessageHandled);
+
+  ws.emitNotification({
+    method: "turn/started",
+    params: {
+      threadId: "root-thread",
+      turn: {
+        id: "fresh-turn",
+      },
+    },
+  });
+
+  child.exitCode = 0;
+  child.emit("close", 0, null);
+
+  const result = await run.finished;
+  assert.equal(result.exitCode, null);
+  assert.equal(result.signal, "SIGINT");
+  assert.equal(result.interrupted, true);
+  assert.equal(result.abortReason, "transport_lost");
+});
+
+test("runCodexTask cancels pending turn completion when a fresh turn starts", async () => {
+  const child = createMockChild();
+  const ws = createMockWebSocket({
+    requestHandlers: createStandardRequestHandlers(),
+  });
+
+  const run = runCodexTask({
+    codexBinPath: "codex",
+    cwd: process.cwd(),
+    prompt: "Do not finish the run between report-turn and continue-turn.",
+    spawnImpl() {
+      return child;
+    },
+    openWebSocketImpl: async () => ws,
+  });
+
+  emitListenBanner(child, 43132);
+  await waitForCondition(
+    () => ws.sentMessages.some((message) => message.method === "turn/start"),
+  );
+
+  ws.emitNotification({
+    method: "turn/completed",
+    params: {
+      threadId: "root-thread",
+      turn: {
+        id: "root-turn",
+      },
+    },
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  ws.emitNotification({
+    method: "turn/started",
+    params: {
+      threadId: "root-thread",
+      turn: {
+        id: "follow-up-turn",
+      },
+    },
+  });
+
+  let settled = false;
+  void run.finished.finally(() => {
+    settled = true;
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 75));
+  assert.equal(settled, false);
+
+  ws.emitNotification({
+    method: "item/completed",
+    params: {
+      threadId: "root-thread",
+      turnId: "follow-up-turn",
+      item: {
+        type: "agentMessage",
+        text: "Continuation after the queued follow-up.",
+        phase: "final_answer",
+      },
+    },
+  });
+  ws.emitNotification({
+    method: "turn/completed",
+    params: {
+      threadId: "root-thread",
+      turn: {
+        id: "follow-up-turn",
+      },
+    },
+  });
+
+  const result = await run.finished;
+  assert.equal(result.exitCode, 0);
+});

@@ -1,0 +1,198 @@
+import fs from "node:fs/promises";
+import path from "node:path";
+
+import {
+  cloneJson,
+  quarantineCorruptFile,
+  writeTextAtomic,
+} from "../state/file-utils.js";
+import { normalizeUiLanguage } from "../i18n/ui-language.js";
+
+const GLOBAL_CONTROL_PANEL_FILE_NAME = "global-control-panel.json";
+const SCREEN_IDS = new Set([
+  "root",
+  "wait",
+  "suffix",
+  "language",
+  "hosts",
+  "new_topic",
+  "new_topic_runtime",
+  "bot_settings",
+  "agent_model",
+  "agent_reasoning",
+  "compact_model",
+  "compact_reasoning",
+]);
+const PENDING_INPUT_KINDS = new Set([
+  "suffix_text",
+  "wait_custom",
+  "new_topic_title",
+]);
+
+function normalizeInteger(value) {
+  return Number.isInteger(value) && value > 0 ? value : null;
+}
+
+function normalizeScreenId(value) {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  return SCREEN_IDS.has(normalized) ? normalized : "root";
+}
+
+function normalizeStatusText(value) {
+  const normalized = String(value ?? "").trim();
+  return normalized || null;
+}
+
+function normalizePendingInput(payload) {
+  const kind = String(payload?.kind ?? "").trim().toLowerCase();
+  if (!PENDING_INPUT_KINDS.has(kind)) {
+    return null;
+  }
+
+  return {
+    kind,
+    requested_at: payload?.requested_at ?? null,
+    requested_by_user_id: String(payload?.requested_by_user_id ?? "").trim() || null,
+    menu_message_id: normalizeInteger(payload?.menu_message_id),
+    prompt_message_id: normalizeInteger(payload?.prompt_message_id),
+    screen: normalizeScreenId(payload?.screen),
+    requested_host_id: String(payload?.requested_host_id ?? "").trim().toLowerCase() || null,
+    requested_host_label: String(payload?.requested_host_label ?? "").trim() || null,
+    requested_runtime_provider: String(payload?.requested_runtime_provider ?? "").trim().toLowerCase() || null,
+    requested_runtime_model: String(payload?.requested_runtime_model ?? "").trim().toLowerCase() || null,
+    status_message: normalizeStatusText(payload?.status_message),
+  };
+}
+
+function normalizeNewTopicHostSelection(payload) {
+  const hostId = String(payload?.host_id ?? payload?.hostId ?? "").trim().toLowerCase();
+  if (!hostId) {
+    return null;
+  }
+  return {
+    host_id: hostId,
+    host_label: String(payload?.host_label ?? payload?.hostLabel ?? hostId).trim() || hostId,
+  };
+}
+
+function buildEmptyGlobalControlPanelState() {
+  return {
+    schema_version: 1,
+    updated_at: null,
+    menu_message_id: null,
+    active_screen: "root",
+    ui_language: "eng",
+    pending_input: null,
+    new_topic_host_selection: null,
+    notice: null,
+  };
+}
+
+function normalizeGlobalControlPanelState(payload) {
+  return {
+    schema_version: 1,
+    updated_at: payload?.updated_at ?? null,
+    menu_message_id: normalizeInteger(payload?.menu_message_id),
+    active_screen: normalizeScreenId(payload?.active_screen),
+    ui_language: normalizeUiLanguage(payload?.ui_language),
+    pending_input: normalizePendingInput(payload?.pending_input),
+    new_topic_host_selection: normalizeNewTopicHostSelection(payload?.new_topic_host_selection),
+    notice: normalizeStatusText(payload?.notice),
+  };
+}
+
+export class GlobalControlPanelStore {
+  constructor(settingsRoot) {
+    this.filePath = path.join(settingsRoot, GLOBAL_CONTROL_PANEL_FILE_NAME);
+    this.cachedState = null;
+    this.writeChain = null;
+  }
+
+  async runExclusive(operation) {
+    const previous = this.writeChain || Promise.resolve();
+    const current = previous
+      .catch(() => {})
+      .then(operation);
+
+    this.writeChain = current;
+
+    try {
+      return await current;
+    } finally {
+      if (this.writeChain === current) {
+        this.writeChain = null;
+      }
+    }
+  }
+
+  async load({ force = false } = {}) {
+    if (this.cachedState && !force) {
+      return cloneJson(this.cachedState);
+    }
+
+    try {
+      const payload = JSON.parse(await fs.readFile(this.filePath, "utf8"));
+      this.cachedState = normalizeGlobalControlPanelState(payload);
+      return cloneJson(this.cachedState);
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        this.cachedState = buildEmptyGlobalControlPanelState();
+        return cloneJson(this.cachedState);
+      }
+
+      if (error instanceof SyntaxError) {
+        await quarantineCorruptFile(this.filePath);
+        this.cachedState = buildEmptyGlobalControlPanelState();
+        return cloneJson(this.cachedState);
+      }
+
+      throw error;
+    }
+  }
+
+  async saveUnlocked(nextState) {
+    const normalized = normalizeGlobalControlPanelState({
+      ...nextState,
+      updated_at: new Date().toISOString(),
+    });
+
+    await writeTextAtomic(
+      this.filePath,
+      `${JSON.stringify(normalized, null, 2)}\n`,
+    );
+    this.cachedState = normalized;
+    return cloneJson(this.cachedState);
+  }
+
+  async save(nextState) {
+    return this.runExclusive(() => this.saveUnlocked(nextState));
+  }
+
+  async patch(patch) {
+    return this.patchWithCurrent(patch);
+  }
+
+  async patchWithCurrent(patch) {
+    return this.runExclusive(async () => {
+      const current = await this.load({ force: true });
+      const resolvedPatch =
+        typeof patch === "function"
+          ? await patch(current)
+          : patch;
+      if (resolvedPatch === null || resolvedPatch === undefined) {
+        return cloneJson(current);
+      }
+      if (
+        typeof resolvedPatch !== "object"
+        || Array.isArray(resolvedPatch)
+      ) {
+        throw new Error("GlobalControlPanelStore patch must be an object or null");
+      }
+
+      return this.saveUnlocked({
+        ...current,
+        ...resolvedPatch,
+      });
+    });
+  }
+}

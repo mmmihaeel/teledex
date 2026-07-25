@@ -1,0 +1,46 @@
+# Local env and secrets
+.env
+*.env
+.env.*
+!.env.example
+!examples/*.env.example
+.envrc
+teledex.env
+
+# Local Teledex state
+/.teledex-state/
+/state/
+/logs/
+/sessions/
+/incoming/
+/indexes/
+/settings/
+/emergency/
+
+# Dependencies and generated outputs
+/node_modules/
+/coverage/
+/.nyc_output/
+/cache/
+/.cache/
+/tmp/
+/.tmp/
+/public-dist/
+/dist/
+/build/
+/target/
+*.log
+*.tmp
+*.bak
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local operator notes
+AGENTS.md
+AGENTS.local.md
+.agents/
+atlas.toml

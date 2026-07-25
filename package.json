@@ -1,0 +1,74 @@
+{
+  "name": "teledex",
+  "version": "0.1.0",
+  "description": "Trusted-operator Telegram gateway for observable remote control of Codez-first agent runtimes.",
+  "author": "Mykhailo Yarytskyi <mikael11032005@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mmmihaeel/teledex.git"
+  },
+  "homepage": "https://github.com/mmmihaeel/teledex#readme",
+  "bugs": {
+    "url": "https://github.com/mmmihaeel/teledex/issues"
+  },
+  "keywords": [
+    "codex",
+    "telegram",
+    "remote-operations",
+    "agent-runtime",
+    "observability"
+  ],
+  "type": "module",
+  "scripts": {
+    "start": "node src/cli/run.js",
+    "run": "node src/cli/run.js",
+    "doctor": "node src/cli/doctor.js",
+    "smoke": "node src/cli/run-smoke.js",
+    "smoke:config": "node scripts/smoke-config.mjs --env-file examples/teledex.env.example",
+    "lint": "node ./node_modules/eslint/bin/eslint.js src scripts test test-support",
+    "typecheck": "tsc --noEmit",
+    "check:syntax": "node scripts/check-syntax.mjs",
+    "test": "node scripts/run-node-tests.mjs",
+    "test:cleanup": "node scripts/run-node-tests.mjs --cleanup-only",
+    "test:exec": "node scripts/run-node-tests.mjs --suite exec",
+    "test:live": "node src/cli/run-live-tests.js --app-server-v2",
+    "test:live:app-server-v2": "node src/cli/run-live-tests.js --app-server-v2",
+    "audit:public": "bash scripts/audit-public-projection.sh --no-export ."
+  },
+  "engines": {
+    "node": "^20.19.0 || ^22.13.0 || >=24"
+  },
+  "dependencies": {
+    "pdfkit": "^0.18.0",
+    "smol-toml": "^1.6.1",
+    "telegram": "^2.26.22"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "depcheck": "^1.4.7",
+    "eslint": "^10.2.1",
+    "globals": "^17.5.0",
+    "knip": "^6.6.3",
+    "typescript": "^6.0.3"
+  },
+  "license": "MIT",
+  "bin": {
+    "teledex": "src/cli/run.js"
+  },
+  "files": [
+    "src/",
+    "scripts/",
+    "docs/",
+    "examples/",
+    "assets/",
+    "test/",
+    "test-support/",
+    "README.md",
+    "LICENSE",
+    ".env.example",
+    "Makefile",
+    "eslint.config.js",
+    "knip.json",
+    "tsconfig.json"
+  ]
+}

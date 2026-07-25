@@ -1,0 +1,12 @@
+export const TELEGRAM_TEXT_LIMIT = 3800;
+export const SUPPORTED_URL_PATTERN = /^(https?:\/\/|tg:\/\/)/iu;
+export const FENCE_PATTERN = /```([^\n`]*)\n?([\s\S]*?)```/gu;
+export const INLINE_CODE_PATTERN = /`([^`\n]+)`/gu;
+export const MARKDOWN_LINK_PATTERN = /\[([^\]\n]+)\]\(([^)\n]+)\)/gu;
+export const HEADING_PATTERN = /^#{1,6}\s+(.+)$/u;
+export const UNORDERED_LIST_PATTERN = /^([ \t]*)([-*+])\s+(.+)$/u;
+export const ORDERED_LIST_PATTERN = /^([ \t]*)(\d+)([.)])\s+(.+)$/u;
+export const TELEGRAM_INDENT = "\u00A0\u00A0\u00A0\u00A0";
+export const PLACEHOLDER_PREFIX = "\u0000TG";
+export const PLACEHOLDER_SUFFIX = "\u0000";
+export const UNORDERED_LIST_MARKERS = ["\u2022", "\u25E6", "\u25AA"];

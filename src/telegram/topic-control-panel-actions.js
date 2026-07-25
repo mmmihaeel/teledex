@@ -1,0 +1,321 @@
+import {
+  getSupportedReasoningLevelsForModel,
+  loadVisibleCodexModels,
+  normalizeModelOverride,
+  normalizeReasoningEffort,
+  resolveCodexRuntimeProfile,
+} from "../session-manager/codex-runtime-settings.js";
+import {
+  normalizeDeepSeekReasoningEffort,
+  normalizeDeepSeekModel,
+  normalizeOpenRouterReasoningEffort,
+  normalizeOpenRouterModel,
+} from "../session-manager/codex-runtime-profiles.js";
+import {
+  normalizePromptSuffixText,
+} from "../session-manager/prompt-suffix.js";
+import {
+  buildLanguageUpdatedMessage,
+  buildInvalidSuffixMessage,
+  buildUnavailableModelMessage,
+  buildUnsupportedReasoningMessage,
+  buildWaitUnavailableMessage,
+} from "./topic-control-panel-view.js";
+import {
+  isDeepSeekTopic,
+  isOpenRouterTopic,
+} from "./topic-runtime-providers.js";
+
+export async function applyTopicControlActionDirect({
+  action,
+  config,
+  language,
+  message,
+  session,
+  sessionService,
+  applyTopicWaitChange,
+}) {
+  if (action.kind === "wait_set") {
+    if (typeof applyTopicWaitChange !== "function") {
+      return {
+        handled: true,
+        statusMessage: buildWaitUnavailableMessage(language),
+      };
+    }
+
+    const applied = await applyTopicWaitChange({
+      message,
+      value: action.value,
+    });
+    if (!applied?.available) {
+      return {
+        handled: true,
+        statusMessage: buildWaitUnavailableMessage(language),
+      };
+    }
+    return { handled: true };
+  }
+
+  if (action.kind === "suffix_set") {
+    if (action.value === "clear") {
+      return {
+        handled: true,
+        session: await sessionService.clearPromptSuffix(session),
+      };
+    }
+
+    if (action.value === "off") {
+      return {
+        handled: true,
+        session: await sessionService.updatePromptSuffix(session, {
+          enabled: false,
+        }),
+      };
+    }
+
+    if (!normalizePromptSuffixText(session?.prompt_suffix_text)) {
+      return {
+        handled: true,
+        statusMessage: buildInvalidSuffixMessage(language),
+      };
+    }
+
+    return {
+      handled: true,
+      session: await sessionService.updatePromptSuffix(session, {
+        enabled: true,
+      }),
+    };
+  }
+
+  if (action.kind === "suffix_routing_set") {
+    return {
+      handled: true,
+      session: await sessionService.updatePromptSuffixTopicState(session, {
+        enabled: action.value === "on",
+      }),
+    };
+  }
+
+  if (action.kind === "model_set") {
+    if (isDeepSeekTopic(session)) {
+      if (action.value === "clear") {
+        return {
+          handled: true,
+          session: await sessionService.clearSessionDeepSeekModel(session),
+        };
+      }
+
+      const normalizedModel = normalizeDeepSeekModel(action.value);
+      if (!normalizedModel) {
+        return {
+          handled: true,
+          statusMessage: buildUnavailableModelMessage(language),
+        };
+      }
+
+      return {
+        handled: true,
+        session: await sessionService.updateSessionDeepSeekModel(session, normalizedModel),
+      };
+    }
+    if (isOpenRouterTopic(session)) {
+      if (action.value === "clear") {
+        return {
+          handled: true,
+          session: await sessionService.clearSessionOpenRouterModel(session),
+        };
+      }
+
+      const normalizedModel = normalizeOpenRouterModel(action.value);
+      if (!normalizedModel) {
+        return {
+          handled: true,
+          statusMessage: buildUnavailableModelMessage(language),
+        };
+      }
+
+      return {
+        handled: true,
+        session: await sessionService.updateSessionOpenRouterModel(session, normalizedModel),
+      };
+    }
+
+    if (action.value === "clear") {
+      return {
+        handled: true,
+        session: await sessionService.clearSessionCodexSetting(
+          session,
+          action.target,
+          "model",
+        ),
+      };
+    }
+
+    const availableModels =
+      typeof sessionService.loadVisibleCodexModels === "function"
+        ? await sessionService.loadVisibleCodexModels(session)
+        : await loadVisibleCodexModels({
+          configPath: config.codexConfigPath,
+        });
+    const normalizedModel = normalizeModelOverride(action.value, availableModels);
+    if (!normalizedModel) {
+      return {
+        handled: true,
+        statusMessage: buildUnavailableModelMessage(language),
+      };
+    }
+
+    return {
+      handled: true,
+      session: await sessionService.updateSessionCodexSetting(
+        session,
+        action.target,
+        "model",
+        normalizedModel,
+      ),
+    };
+  }
+
+  if (action.kind === "reasoning_set") {
+    if (isDeepSeekTopic(session)) {
+      if (action.value === "clear") {
+        return {
+          handled: true,
+          session: await sessionService.clearSessionCodexSetting(
+            session,
+            action.target,
+            "reasoning",
+          ),
+        };
+      }
+
+      const normalizedReasoning = normalizeDeepSeekReasoningEffort(action.value);
+      if (!normalizedReasoning) {
+        return {
+          handled: true,
+          statusMessage: buildUnsupportedReasoningMessage(language),
+        };
+      }
+
+      return {
+        handled: true,
+        session: await sessionService.updateSessionCodexSetting(
+          session,
+          action.target,
+          "reasoning",
+          normalizedReasoning,
+        ),
+      };
+    }
+    if (isOpenRouterTopic(session)) {
+      if (action.value === "clear") {
+        return {
+          handled: true,
+          session: await sessionService.clearSessionCodexSetting(
+            session,
+            action.target,
+            "reasoning",
+          ),
+        };
+      }
+
+      const normalizedReasoning = normalizeOpenRouterReasoningEffort(action.value);
+      if (!normalizedReasoning) {
+        return {
+          handled: true,
+          statusMessage: buildUnsupportedReasoningMessage(language),
+        };
+      }
+
+      return {
+        handled: true,
+        session: await sessionService.updateSessionCodexSetting(
+          session,
+          action.target,
+          "reasoning",
+          normalizedReasoning,
+        ),
+      };
+    }
+
+    if (action.value === "clear") {
+      return {
+        handled: true,
+        session: await sessionService.clearSessionCodexSetting(
+          session,
+          action.target,
+          "reasoning",
+        ),
+      };
+    }
+
+    const normalizedReasoning = normalizeReasoningEffort(action.value);
+    const runtimeModels =
+      typeof sessionService.loadAvailableCodexModels === "function"
+        ? await sessionService.loadAvailableCodexModels(session)
+        : [];
+    const globalSettings = await sessionService.getGlobalCodexSettings();
+    const runtimeProfile = resolveCodexRuntimeProfile({
+      session,
+      globalSettings,
+      config,
+      target: action.target,
+      availableModels: runtimeModels,
+    });
+    const supportedLevels = getSupportedReasoningLevelsForModel(
+      runtimeModels,
+      runtimeProfile.model,
+    ).map((entry) => entry.value);
+
+    if (!normalizedReasoning || !supportedLevels.includes(normalizedReasoning)) {
+      return {
+        handled: true,
+        statusMessage: buildUnsupportedReasoningMessage(language),
+      };
+    }
+
+    return {
+      handled: true,
+      session: await sessionService.updateSessionCodexSetting(
+        session,
+        action.target,
+        "reasoning",
+        normalizedReasoning,
+      ),
+    };
+  }
+
+  if (action.kind === "language_set") {
+    const nextSession = await sessionService.updateUiLanguage(session, {
+      language: action.value,
+    });
+    return {
+      handled: true,
+      session: nextSession,
+      statusMessage: buildLanguageUpdatedMessage(nextSession.ui_language),
+    };
+  }
+
+  return { handled: false };
+}
+
+export function getRefreshScreenForAction(action) {
+  if (action.kind === "wait_set") {
+    return "wait";
+  }
+
+  if (action.kind === "suffix_set" || action.kind === "suffix_routing_set") {
+    return "suffix";
+  }
+
+  if (action.kind === "model_set") {
+    return `${action.target}_model`;
+  }
+
+  if (action.kind === "reasoning_set") {
+    return `${action.target}_reasoning`;
+  }
+
+  return "root";
+}

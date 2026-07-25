@@ -1,0 +1,880 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+
+import {
+  handleIncomingMessage,
+} from "../src/telegram/command-router.js";
+import {
+  buildNoSessionTopicMessage,
+} from "../src/telegram/command-handlers/prompt-flow.js";
+import { PromptFragmentAssembler } from "../src/telegram/prompt-fragment-assembler.js";
+
+const config = {
+  telegramAllowedUserId: "1001001001",
+  telegramAllowedUserIds: ["1001001001"],
+  telegramAllowedBotIds: ["1002002002"],
+  telegramForumChatId: "-1000000",
+  maxParallelSessions: 4,
+  codexModel: "gpt-5.4",
+  codexReasoningEffort: "medium",
+  codexContextWindow: 320000,
+  codexAutoCompactTokenLimit: 300000,
+  codexConfigPath: "/tmp/teledex-tests-missing-config.toml",
+};
+
+function buildUnlimitedLimitsSummary(overrides = {}) {
+  return {
+    available: true,
+    capturedAt: "2026-04-04T13:00:00.000Z",
+    source: "windows_worker",
+    planType: "business",
+    limitName: "codex",
+    unlimited: true,
+    windows: [],
+    primary: null,
+    secondary: null,
+    ...overrides,
+  };
+}
+
+function buildWindowedLimitsSummary(overrides = {}) {
+  return {
+    available: true,
+    capturedAt: "2026-04-04T13:10:00.000Z",
+    source: "windows_worker",
+    planType: null,
+    limitName: "codex",
+    unlimited: false,
+    windows: [
+      {
+        label: "5h",
+        usedPercent: 11,
+        remainingPercent: 89,
+        windowMinutes: 300,
+        resetsAt: 1775277000,
+        resetsAtIso: "2026-04-03T03:10:00.000Z",
+      },
+      {
+        label: "7d",
+        usedPercent: 33,
+        remainingPercent: 67,
+        windowMinutes: 10080,
+        resetsAt: 1775881800,
+        resetsAtIso: "2026-04-10T03:10:00.000Z",
+      },
+    ],
+    primary: {
+      label: "5h",
+      usedPercent: 11,
+      remainingPercent: 89,
+      windowMinutes: 300,
+      resetsAt: 1775277000,
+      resetsAtIso: "2026-04-03T03:10:00.000Z",
+    },
+    secondary: {
+      label: "7d",
+      usedPercent: 33,
+      remainingPercent: 67,
+      windowMinutes: 10080,
+      resetsAt: 1775881800,
+      resetsAtIso: "2026-04-10T03:10:00.000Z",
+    },
+    ...overrides,
+  };
+}
+
+function createGlobalControlPanelStore(initialState = {}) {
+  let state = {
+    schema_version: 1,
+    updated_at: null,
+    menu_message_id: null,
+    active_screen: "root",
+    ui_language: "eng",
+    pending_input: null,
+    ...initialState,
+  };
+
+  return {
+    async load() {
+      return JSON.parse(JSON.stringify(state));
+    },
+    async patch(patch) {
+      state = {
+        ...state,
+        ...patch,
+        updated_at: new Date().toISOString(),
+      };
+      return JSON.parse(JSON.stringify(state));
+    },
+    getState() {
+      return JSON.parse(JSON.stringify(state));
+    },
+  };
+}
+
+test("handleIncomingMessage replies with guidance in General topic for /status", async () => {
+  const sent = [];
+  const serviceState = {
+    ignoredUpdates: 0,
+    handledCommands: 0,
+    lastCommandName: null,
+    lastCommandAt: null,
+  };
+
+  const result = await handleIncomingMessage({
+    api: {
+      async sendMessage(payload) {
+        sent.push(payload);
+      },
+    },
+    botUsername: "gatewaybot",
+    config,
+    message: {
+      text: "/status",
+      entities: [{ type: "bot_command", offset: 0, length: 7 }],
+      from: { id: 1001001001, is_bot: false },
+      chat: { id: -1000000 },
+    },
+    serviceState,
+    sessionService: {
+      async ensureSessionForMessage() {
+        throw new Error("should not be called");
+      },
+    },
+    workerPool: {
+      getActiveRun() {
+        return null;
+      },
+      interrupt() {
+        return false;
+      },
+    },
+  });
+
+  assert.equal(result.reason, "general-topic");
+  assert.equal(sent[0].text, buildNoSessionTopicMessage());
+});
+
+test("handleIncomingMessage uses the global panel ENG language for General-topic guidance", async () => {
+  const sent = [];
+  const serviceState = {
+    ignoredUpdates: 0,
+    handledCommands: 0,
+    lastCommandName: null,
+    lastCommandAt: null,
+  };
+
+  const result = await handleIncomingMessage({
+    api: {
+      async sendMessage(payload) {
+        sent.push(payload);
+      },
+    },
+    botUsername: "gatewaybot",
+    config,
+    globalControlPanelStore: createGlobalControlPanelStore({
+      ui_language: "eng",
+    }),
+    message: {
+      text: "/status",
+      entities: [{ type: "bot_command", offset: 0, length: 7 }],
+      from: { id: 1001001001, is_bot: false },
+      chat: { id: -1000000 },
+    },
+    serviceState,
+    sessionService: {
+      async ensureSessionForMessage() {
+        throw new Error("should not be called");
+      },
+    },
+    workerPool: {
+      getActiveRun() {
+        return null;
+      },
+      interrupt() {
+        return false;
+      },
+    },
+  });
+
+  assert.equal(result.reason, "general-topic");
+  assert.equal(sent[0].text, buildNoSessionTopicMessage("eng"));
+});
+
+test("handleIncomingMessage returns Codex limits in General without requiring a topic session", async () => {
+  const sent = [];
+
+  const result = await handleIncomingMessage({
+    api: {
+      async sendMessage(payload) {
+        sent.push(payload);
+      },
+    },
+    botUsername: "gatewaybot",
+    config,
+    message: {
+      text: "/limits",
+      entities: [{ type: "bot_command", offset: 0, length: 7 }],
+      from: { id: 1001001001, is_bot: false },
+      chat: { id: -1000000 },
+    },
+    serviceState: {
+      ignoredUpdates: 0,
+      handledCommands: 0,
+      lastCommandName: null,
+      lastCommandAt: null,
+    },
+    sessionService: {
+      async ensureSessionForMessage() {
+        throw new Error("should not be called");
+      },
+      async getCodexLimitsSummary() {
+        return buildUnlimitedLimitsSummary();
+      },
+    },
+    workerPool: {
+      getActiveRun() {
+        return null;
+      },
+      interrupt() {
+        return false;
+      },
+    },
+  });
+
+  assert.equal(result.command, "limits");
+  assert.match(sent[0].text, /Codex limits/u);
+  assert.match(sent[0].text, /mode: unlimited/u);
+});
+
+test("handleIncomingMessage accepts /wait global from General", async () => {
+  const sent = [];
+  const promptFragmentAssembler = new PromptFragmentAssembler();
+
+  const result = await handleIncomingMessage({
+    api: {
+      async sendMessage(payload) {
+        sent.push(payload);
+      },
+    },
+    botUsername: "gatewaybot",
+    config,
+    message: {
+      text: "/wait global 60",
+      entities: [{ type: "bot_command", offset: 0, length: 5 }],
+      from: { id: 1001001001, is_bot: false },
+      chat: { id: -1000000 },
+    },
+    promptFragmentAssembler,
+    serviceState: {
+      ignoredUpdates: 0,
+      handledCommands: 0,
+      lastCommandName: null,
+      lastCommandAt: null,
+    },
+    sessionService: {},
+    workerPool: {
+      getActiveRun() {
+        return null;
+      },
+      interrupt() {
+        return false;
+      },
+    },
+  });
+
+  const waitState = promptFragmentAssembler.getStateForMessage({
+    chat: { id: -1000000 },
+    from: { id: 1001001001 },
+  });
+
+  assert.equal(result.command, "wait");
+  assert.equal(waitState.global.active, true);
+  assert.equal(waitState.global.flushDelayMs, 60000);
+  assert.match(sent[0].text, /Global collection window enabled/u);
+});
+
+test("handleIncomingMessage keeps /wait global replies in ENG when General panel language is ENG", async () => {
+  const sent = [];
+  const promptFragmentAssembler = new PromptFragmentAssembler();
+
+  const result = await handleIncomingMessage({
+    api: {
+      async sendMessage(payload) {
+        sent.push(payload);
+      },
+    },
+    botUsername: "gatewaybot",
+    config,
+    globalControlPanelStore: createGlobalControlPanelStore({
+      ui_language: "eng",
+    }),
+    message: {
+      text: "/wait global 60",
+      entities: [{ type: "bot_command", offset: 0, length: 5 }],
+      from: { id: 1001001001, is_bot: false },
+      chat: { id: -1000000 },
+    },
+    promptFragmentAssembler,
+    serviceState: {
+      ignoredUpdates: 0,
+      handledCommands: 0,
+      lastCommandName: null,
+      lastCommandAt: null,
+    },
+    sessionService: {},
+    workerPool: {
+      getActiveRun() {
+        return null;
+      },
+      interrupt() {
+        return false;
+      },
+    },
+  });
+
+  assert.equal(result.command, "wait");
+  assert.match(sent[0].text, /Global collection window enabled\./u);
+  assert.match(sent[0].text, /Send a separate `All` message/u);
+});
+
+test("handleIncomingMessage stores a global Agent model via /model global", async () => {
+  const sent = [];
+  const updates = [];
+  const serviceState = {
+    ignoredUpdates: 0,
+    handledCommands: 0,
+    lastCommandName: null,
+    lastCommandAt: null,
+  };
+
+  const result = await handleIncomingMessage({
+    api: {
+      async sendMessage(payload) {
+        sent.push(payload);
+      },
+    },
+    botUsername: "gatewaybot",
+    config,
+    message: {
+      text: "/model global gpt-5.4-mini",
+      entities: [{ type: "bot_command", offset: 0, length: 6 }],
+      from: { id: 1001001001, is_bot: false },
+      chat: { id: -1000000 },
+    },
+    serviceState,
+    sessionService: {
+      async getGlobalCodexSettings() {
+        return {
+          agent_model: null,
+          agent_reasoning_effort: null,
+        };
+      },
+      async updateGlobalCodexSetting(target, kind, value) {
+        updates.push({ target, kind, value });
+        return {
+          agent_model: value,
+          agent_reasoning_effort: null,
+        };
+      },
+    },
+    workerPool: {
+      getActiveRun() {
+        return null;
+      },
+      interrupt() {
+        return false;
+      },
+    },
+  });
+
+  assert.equal(result.command, "model");
+  assert.deepEqual(updates, [
+    { target: "agent", kind: "model", value: "gpt-5.4-mini" },
+  ]);
+  assert.match(sent[0].text, /Agent model updated\./u);
+  assert.match(sent[0].text, /global default: gpt-5\.4-mini/u);
+  assert.match(sent[0].text, /effective: gpt-5\.4-mini \(global\)/u);
+});
+
+test("handleIncomingMessage keeps global model replies in ENG when General panel language is ENG", async () => {
+  const sent = [];
+  const updates = [];
+  const serviceState = {
+    ignoredUpdates: 0,
+    handledCommands: 0,
+    lastCommandName: null,
+    lastCommandAt: null,
+  };
+
+  const result = await handleIncomingMessage({
+    api: {
+      async sendMessage(payload) {
+        sent.push(payload);
+      },
+    },
+    botUsername: "gatewaybot",
+    config,
+    globalControlPanelStore: createGlobalControlPanelStore({
+      ui_language: "eng",
+    }),
+    message: {
+      text: "/model global gpt-5.4-mini",
+      entities: [{ type: "bot_command", offset: 0, length: 6 }],
+      from: { id: 1001001001, is_bot: false },
+      chat: { id: -1000000 },
+    },
+    serviceState,
+    sessionService: {
+      async getGlobalCodexSettings() {
+        return {
+          agent_model: null,
+          agent_reasoning_effort: null,
+        };
+      },
+      async updateGlobalCodexSetting(target, kind, value) {
+        updates.push({ target, kind, value });
+        return {
+          agent_model: value,
+          agent_reasoning_effort: null,
+        };
+      },
+    },
+    workerPool: {
+      getActiveRun() {
+        return null;
+      },
+      interrupt() {
+        return false;
+      },
+    },
+  });
+
+  assert.equal(result.command, "model");
+  assert.deepEqual(updates, [
+    { target: "agent", kind: "model", value: "gpt-5.4-mini" },
+  ]);
+  assert.match(sent[0].text, /Agent model updated\./u);
+  assert.match(sent[0].text, /global default: gpt-5\.4-mini/u);
+  assert.match(sent[0].text, /Usage: \/model/u);
+});
+
+test("handleIncomingMessage validates /reasoning global against the global target model", async () => {
+  const runtimeDir = await fs.mkdtemp(
+    path.join(os.tmpdir(), "teledex-runtime-settings-"),
+  );
+  const codexConfigPath = path.join(runtimeDir, "config.toml");
+  await fs.writeFile(codexConfigPath, 'model = "gpt-5.4"\n', "utf8");
+  await fs.writeFile(
+    path.join(runtimeDir, "models_cache.json"),
+    `${JSON.stringify({
+      models: [
+        {
+          slug: "gpt-5.4",
+          display_name: "GPT-5.4",
+          default_reasoning_level: "medium",
+          supported_reasoning_levels: [
+            { effort: "low" },
+            { effort: "medium" },
+            { effort: "high" },
+            { effort: "xhigh" },
+          ],
+        },
+        {
+          slug: "gpt-5.4-mini",
+          display_name: "GPT-5.4-Mini",
+          default_reasoning_level: "medium",
+          supported_reasoning_levels: [
+            { effort: "medium" },
+            { effort: "high" },
+          ],
+        },
+      ],
+    }, null, 2)}\n`,
+    "utf8",
+  );
+
+  const sent = [];
+  const updates = [];
+  const serviceState = {
+    ignoredUpdates: 0,
+    handledCommands: 0,
+    lastCommandName: null,
+    lastCommandAt: null,
+  };
+  const session = {
+    session_key: "-1000000:77",
+    chat_id: "-1000000",
+    topic_id: "77",
+    topic_name: "Runtime topic",
+    lifecycle_state: "active",
+    ui_language: "eng",
+    agent_model_override: "gpt-5.4-mini",
+    workspace_binding: {
+      repo_root: "/path/to/workspace",
+      cwd: "/path/to/workspace",
+      branch: "main",
+      worktree_path: "/path/to/workspace",
+    },
+  };
+
+  const result = await handleIncomingMessage({
+    api: {
+      async sendMessage(payload) {
+        sent.push(payload);
+      },
+    },
+    botUsername: "gatewaybot",
+    config: {
+      ...config,
+      codexConfigPath,
+    },
+    message: {
+      text: "/reasoning global xhigh",
+      entities: [{ type: "bot_command", offset: 0, length: 10 }],
+      from: { id: 1001001001, is_bot: false },
+      chat: { id: -1000000 },
+      message_thread_id: 77,
+    },
+    serviceState,
+    sessionService: {
+      async ensureSessionForMessage() {
+        return session;
+      },
+      async getGlobalCodexSettings() {
+        return {
+          agent_model: "gpt-5.4",
+          agent_reasoning_effort: null,
+        };
+      },
+      async updateGlobalCodexSetting(target, kind, value) {
+        updates.push({ target, kind, value });
+        return {
+          agent_model: "gpt-5.4",
+          agent_reasoning_effort: value,
+        };
+      },
+      async resolveCodexRuntimeProfile(current, { target }) {
+        return target === "agent"
+          ? {
+              model: current.agent_model_override ?? "gpt-5.4",
+              modelSource: current.agent_model_override ? "topic" : "global",
+              reasoningEffort: "xhigh",
+              reasoningSource: "global",
+            }
+          : {
+              model: "gpt-5.4",
+              modelSource: "default",
+              reasoningEffort: "medium",
+              reasoningSource: "default",
+            };
+      },
+      async recordHandledSession(_, current) {
+        return current;
+      },
+    },
+    workerPool: {
+      getActiveRun() {
+        return null;
+      },
+      interrupt() {
+        return false;
+      },
+    },
+  });
+
+  assert.equal(result.command, "reasoning");
+  assert.deepEqual(updates, [
+    { target: "agent", kind: "reasoning", value: "xhigh" },
+  ]);
+  assert.match(sent[0].text, /Agent reasoning updated\./u);
+  assert.match(sent[0].text, /global default: Extra High \(xhigh\)/u);
+});
+
+test("handleIncomingMessage shows the resolved Agent runtime profile in /status", async () => {
+  const sent = [];
+  const serviceState = {
+    ignoredUpdates: 0,
+    handledCommands: 0,
+    lastCommandName: null,
+    lastCommandAt: null,
+    codexModel: "gpt-5.4",
+    codexReasoningEffort: "medium",
+    codexContextWindow: 320000,
+    codexAutoCompactTokenLimit: 300000,
+  };
+  const session = {
+    session_key: "-1000000:77",
+    chat_id: "-1000000",
+    topic_id: "77",
+    topic_name: "Status topic",
+    lifecycle_state: "active",
+    ui_language: "eng",
+    workspace_binding: {
+      repo_root: "/path/to/workspace",
+      cwd: "/path/to/workspace",
+      branch: "main",
+      worktree_path: "/path/to/workspace",
+    },
+  };
+
+  const result = await handleIncomingMessage({
+    api: {
+      async sendMessage(payload) {
+        sent.push(payload);
+      },
+    },
+    botUsername: "gatewaybot",
+    config,
+    message: {
+      text: "/status",
+      entities: [{ type: "bot_command", offset: 0, length: 7 }],
+      from: { id: 1001001001, is_bot: false },
+      chat: { id: -1000000 },
+      message_thread_id: 77,
+    },
+    serviceState,
+    sessionService: {
+      async ensureSessionForMessage() {
+        return session;
+      },
+      async resolveContextSnapshot(current) {
+        return {
+          session: current,
+          snapshot: null,
+        };
+      },
+      async resolveCodexRuntimeProfile(_, { target }) {
+        return target === "agent"
+          ? {
+              model: "gpt-5.4-mini",
+              modelSource: "topic",
+              reasoningEffort: "high",
+              reasoningSource: "topic",
+            }
+          : {
+              model: "gpt-5.4",
+              modelSource: "global",
+              reasoningEffort: "low",
+              reasoningSource: "global",
+            };
+      },
+      async getCodexLimitsSummary() {
+        return buildWindowedLimitsSummary();
+      },
+      async recordHandledSession() {},
+    },
+    workerPool: {
+      getActiveRun() {
+        return null;
+      },
+      interrupt() {
+        return false;
+      },
+    },
+  });
+
+  assert.equal(result.command, "status");
+  assert.match(sent[0].text, /model: gpt-5\.4-mini/u);
+  assert.match(sent[0].text, /reasoning: High \(high\)/u);
+  assert.match(sent[0].text, /limits 5h: 89% left/u);
+});
+
+test("handleIncomingMessage shows topic-local Codex limits", async () => {
+  const sent = [];
+  const session = {
+    session_key: "-1000000:77",
+    chat_id: "-1000000",
+    topic_id: "77",
+    topic_name: "Limits topic",
+    lifecycle_state: "active",
+    ui_language: "eng",
+    workspace_binding: {
+      repo_root: "/path/to/workspace",
+      cwd: "/path/to/workspace",
+      branch: "main",
+      worktree_path: "/path/to/workspace",
+    },
+  };
+
+  const result = await handleIncomingMessage({
+    api: {
+      async sendMessage(payload) {
+        sent.push(payload);
+      },
+    },
+    botUsername: "gatewaybot",
+    config,
+    message: {
+      text: "/limits",
+      entities: [{ type: "bot_command", offset: 0, length: 7 }],
+      from: { id: 1001001001, is_bot: false },
+      chat: { id: -1000000 },
+      message_thread_id: 77,
+    },
+    serviceState: {
+      ignoredUpdates: 0,
+      handledCommands: 0,
+      lastCommandName: null,
+      lastCommandAt: null,
+    },
+    sessionService: {
+      async ensureSessionForMessage() {
+        return session;
+      },
+      async getCodexLimitsSummary() {
+        return buildWindowedLimitsSummary();
+      },
+      async recordHandledSession() {
+        return session;
+      },
+    },
+    workerPool: {
+      getActiveRun() {
+        return null;
+      },
+      interrupt() {
+        return false;
+      },
+    },
+  });
+
+  assert.equal(result.command, "limits");
+  assert.match(sent[0].text, /Codex limits/u);
+  assert.match(sent[0].text, /5h: 89% left/u);
+  assert.match(sent[0].text, /7d: 67% left/u);
+});
+
+test("handleIncomingMessage reports /interrupt as a stop request, not a completed stop", async () => {
+  const sent = [];
+  const session = {
+    session_key: "-1000000:77",
+    chat_id: "-1000000",
+    topic_id: "77",
+    topic_name: "Interrupt topic",
+    lifecycle_state: "active",
+    ui_language: "eng",
+    workspace_binding: {
+      repo_root: "/path/to/workspace",
+      cwd: "/path/to/workspace",
+      branch: "main",
+      worktree_path: "/path/to/workspace",
+    },
+  };
+
+  const result = await handleIncomingMessage({
+    api: {
+      async sendMessage(payload) {
+        sent.push(payload);
+      },
+    },
+    botUsername: "gatewaybot",
+    config,
+    message: {
+      text: "/interrupt",
+      entities: [{ type: "bot_command", offset: 0, length: 10 }],
+      from: { id: 1001001001, is_bot: false },
+      chat: { id: -1000000 },
+      message_thread_id: 77,
+    },
+    serviceState: {
+      ignoredUpdates: 0,
+      handledCommands: 0,
+      lastCommandName: null,
+      lastCommandAt: null,
+    },
+    sessionService: {
+      async ensureSessionForMessage() {
+        return session;
+      },
+      async recordHandledSession() {
+        return session;
+      },
+    },
+    workerPool: {
+      getActiveRun() {
+        return { state: { status: "running" } };
+      },
+      interrupt() {
+        return true;
+      },
+    },
+  });
+
+  assert.equal(result.command, "interrupt");
+  assert.match(
+    sent[0].text,
+    /Stop requested\. I will confirm here when the run actually stops\./u,
+  );
+});
+
+test("handleIncomingMessage updates the topic UI language with /language eng", async () => {
+  const sent = [];
+  let patched = null;
+  const serviceState = {
+    ignoredUpdates: 0,
+    handledCommands: 0,
+    lastCommandName: null,
+    lastCommandAt: null,
+  };
+  const session = {
+    session_key: "-1000000:77",
+    chat_id: "-1000000",
+    topic_id: "77",
+    topic_name: "Language topic",
+    lifecycle_state: "active",
+    ui_language: "eng",
+    workspace_binding: {
+      repo_root: "/path/to/workspace",
+      cwd: "/path/to/workspace",
+      branch: "main",
+      worktree_path: "/path/to/workspace",
+    },
+  };
+
+  const result = await handleIncomingMessage({
+    api: {
+      async sendMessage(payload) {
+        sent.push(payload);
+      },
+    },
+    botUsername: "gatewaybot",
+    config,
+    message: {
+      text: "/language eng",
+      entities: [{ type: "bot_command", offset: 0, length: 9 }],
+      from: { id: 1001001001, is_bot: false },
+      chat: { id: -1000000 },
+      message_thread_id: 77,
+    },
+    serviceState,
+    sessionService: {
+      async ensureSessionForMessage() {
+        return session;
+      },
+      async updateUiLanguage(current, { language }) {
+        patched = { ...current, ui_language: language };
+        return patched;
+      },
+      async recordHandledSession() {
+        return patched || session;
+      },
+    },
+    workerPool: {
+      getActiveRun() {
+        return null;
+      },
+      interrupt() {
+        return false;
+      },
+    },
+  });
+
+  assert.equal(result.command, "language");
+  assert.equal(patched.ui_language, "eng");
+  assert.match(sent[0].text, /Interface language updated\./u);
+  assert.match(sent[0].text, /current: ENG/u);
+});

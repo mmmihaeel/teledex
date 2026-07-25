@@ -1,0 +1,35 @@
+{
+  "$schema": "https://unpkg.com/knip@6/schema.json",
+  "entry": [
+    "src/cli/admin.js",
+    "src/cli/doctor.js",
+    "src/cli/host-bootstrap.js",
+    "src/cli/host-bootstrap-runtime.js",
+    "src/cli/host-doctor.js",
+    "src/cli/host-executor.js",
+    "src/cli/host-remote-smoke.js",
+    "src/cli/install-host-sync-timer.js",
+    "src/cli/install-user-service.js",
+    "src/cli/registry-sync.js",
+    "src/cli/run-live-tests.js",
+    "src/cli/run-smoke.js",
+    "src/cli/run.js",
+    "src/cli/service-rollout.js",
+    "src/cli/soak.js",
+    "src/cli/user-live-e2e.js",
+    "src/cli/user-live-agent-audit.js",
+    "src/cli/user-login.js",
+    "src/cli/user-status.js",
+    "scripts/check-syntax.mjs",
+    "scripts/generate-guidebook-pdf.mjs",
+    "scripts/generate-runbook-pdf.mjs",
+    "scripts/run-node-tests.mjs",
+    "test/**/*.test.js"
+  ],
+  "project": [
+    "src/**/*.js",
+    "scripts/**/*.mjs",
+    "test/**/*.js",
+    "test-support/**/*.js"
+  ]
+}
